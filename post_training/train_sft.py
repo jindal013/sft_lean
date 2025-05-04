@@ -1,36 +1,126 @@
 import os
-from trl import SFTTrainer, SFTTrainingArguments
-from load_model import get_training_model_and_tokenizer
-from dataset import load_sft_dataset
+import random
+import argparse
+
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments
+)
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer
 
 
-def main():
-    model_name = "AI-MO/Kimina-Prover-Preview-Distill-1.5B"
-    train_path = "data/sft_train.jsonl"
-    output_dir = "outputs/sft"
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    model, tokenizer = get_training_model_and_tokenizer(model_name)
-    train_dataset = load_sft_dataset(train_path)
 
-    training_args = SFTTrainingArguments(
-        output_dir=output_dir,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
-        learning_rate=5e-5,
-        num_train_epochs=3,
-        logging_steps=100,
-        save_steps=500,
-        fp16=True,
+def prepare_dataset(csv_path: str, tokenizer, test_size: float, seed: int):
+    # Load CSV and tokenize
+    ds = load_dataset("csv", data_files={"train": csv_path})["train"]
+    
+    def tokenize_example(example):
+        messages = [
+            {"role": "user", "content": f"{example['instruction']} {example['input']}"},
+            {"role": "assistant", "content": example['output']},
+        ]
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+        tokenized = tokenizer(prompt, return_tensors="pt")
+        return {"prompt": prompt, **tokenized}
+
+    ds = ds.map(tokenize_example, batched=False)
+    ds = ds.shuffle(seed=seed)
+    splits = ds.train_test_split(test_size=test_size)
+    return splits['train'], splits['test']
+
+
+def main(args):
+    # Set random seed for reproducibility
+    set_seed(args.seed)
+
+    # Load tokenizer and model with LoRA
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, padding_side="right", add_eos_token=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id,
+        torch_dtype=getattr(torch, args.precision),
+        device_map="auto"
+    )
+    model.gradient_checkpointing_enable()
+
+    # Identify linear modules for LoRA
+    linear_module_names = [name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)]
+    target_modules = linear_module_names[: args.modules_limit]
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, lora_config)
+
+    # Prepare datasets
+    train_ds, eval_ds = prepare_dataset(args.data_path, tokenizer, args.test_size, args.seed)
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        warmup_steps=args.warmup_steps,
+        max_steps=args.max_steps,
+        learning_rate=args.learning_rate,
+        logging_steps=args.logging_steps,
+        evaluation_strategy="steps",
+        eval_steps=args.eval_steps,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        optim=args.optim,
+        logging_dir=os.path.join(args.output_dir, "logs"),
+        report_to=args.report_to or []
     )
 
+    # Initialize SFT Trainer
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        peft_config=lora_config,
+        dataset_text_field="prompt",
+        args=training_args
     )
+
+    # Start training
     trainer.train()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Supervised Fine-Tuning with LoRA and TRL SFTTrainer")
+    parser.add_argument("--model_id", type=str, required=True, help="Hugging Face model identifier")
+    parser.add_argument("--data_path", type=str, required=True, help="Path to CSV dataset with instruction,input,output columns")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--test_size", type=float, default=0.1, help="Fraction of data for evaluation split")
+    parser.add_argument("--modules_limit", type=int, default=10, help="Max number of linear modules to apply LoRA")
+    parser.add_argument("--lora_rank", type=int, default=2, help="LoRA rank r")
+    parser.add_argument("--lora_alpha", type=float, default=0.5, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
+    parser.add_argument("--batch_size", type=int, default=4, help="Training batch size per device")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument("--eval_steps", type=int, default=200)
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--logging_steps", type=int, default=50)
+    parser.add_argument("--optim", type=str, default="adamw_torch")
+    parser.add_argument("--precision", type=str, choices=["bfloat16", "float32", "float16"], default="bfloat16")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--report_to", nargs="*", default=None)
+    args = parser.parse_args()
+    main(args)
