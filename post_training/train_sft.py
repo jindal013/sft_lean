@@ -21,7 +21,7 @@ def set_seed(seed: int):
 
 
 def prepare_dataset(csv_path: str, tokenizer, test_size: float, seed: int):
-    # Load CSV and tokenize
+    # load csv and tokenize
     ds = load_dataset("csv", data_files={"train": csv_path})["train"]
     
     def tokenize_example(example):
@@ -40,10 +40,10 @@ def prepare_dataset(csv_path: str, tokenizer, test_size: float, seed: int):
 
 
 def main(args):
-    # Set random seed for reproducibility
+    # set random seed for reproducibility
     set_seed(args.seed)
 
-    # Load tokenizer and model with LoRA
+    # load tokenizer and model with lora
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, padding_side="right", add_eos_token=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
@@ -52,7 +52,7 @@ def main(args):
     )
     model.gradient_checkpointing_enable()
 
-    # Identify linear modules for LoRA
+    # identify linear modules for lora
     linear_module_names = [name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)]
     target_modules = linear_module_names[: args.modules_limit]
     lora_config = LoraConfig(
@@ -65,10 +65,10 @@ def main(args):
     )
     model = get_peft_model(model, lora_config)
 
-    # Prepare datasets
+    # prepare datasets
     train_ds, eval_ds = prepare_dataset(args.data_path, tokenizer, args.test_size, args.seed)
 
-    # Training arguments
+    # training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -86,7 +86,7 @@ def main(args):
         report_to=args.report_to or []
     )
 
-    # Initialize SFT Trainer
+    # initialize sft trainer
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_ds,
@@ -96,13 +96,13 @@ def main(args):
         args=training_args
     )
 
-    # Start training
+    # start training
     trainer.train()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Supervised Fine-Tuning with LoRA and TRL SFTTrainer")
-    parser.add_argument("--model_id", type=str, required=True, help="Hugging Face model identifier")
+    parser.add_argument("--model_id", type=str, required=True, help="KAMINO MODEL HERE") # TODO for me: add model here!!
     parser.add_argument("--data_path", type=str, required=True, help="Path to CSV dataset with instruction,input,output columns")
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--test_size", type=float, default=0.1, help="Fraction of data for evaluation split")
